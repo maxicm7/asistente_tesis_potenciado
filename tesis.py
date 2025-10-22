@@ -3,7 +3,7 @@ import pypdf
 import io
 import os
 
-# --- Importaciones de LangChain (Actualizadas y verificadas) ---
+# --- Importaciones actualizadas para LangChain v0.2+ ---
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
@@ -11,13 +11,6 @@ from langchain_community.llms import HuggingFaceHub
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# Para RAG: Estos son los nuevos módulos
-from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnableParallel
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.retrievers import BaseRetriever
-from langchain_core.documents import Document
 
 # --- Configuración General ---
 MASTER_PROMPT_ROLE = """
@@ -76,7 +69,7 @@ def create_vector_store(pdf_files):
 
 def get_llm_chain(vector_store, api_key, model_name, temperature):
     """
-    Configura y devuelve la cadena RAG completa lista para usarse.
+    Configura y devuelve la cadena RAG completa lista para usarse (compatible con LangChain >=0.2).
     """
     try:
         # 1. Configurar el LLM (Modelo de Lenguaje)
@@ -85,20 +78,20 @@ def get_llm_chain(vector_store, api_key, model_name, temperature):
             huggingfacehub_api_token=api_key,
             model_kwargs={
                 "temperature": temperature,
-                "max_new_tokens": 1024, # Ajusta según necesites respuestas más largas
+                "max_new_tokens": 1024,
                 "repetition_penalty": 1.1,
                 "return_full_text": False
             }
         )
 
-        # 2. Configurar el Retriever (Buscador)
+        # 2. Configurar el Retriever
         retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
 
         # 3. Crear el Prompt Template
         system_prompt = (
             f"{MASTER_PROMPT_ROLE}\n\n"
             "Utiliza los siguientes fragmentos de contexto recuperado para responder a la pregunta.\n"
-            "Si no sabes la respuesta basándote en el contexto, dilo. No inventes.\n\n"
+            "Si no sabes la respuesta basándote en el contexto, dilo explícitamente. No inventes.\n\n"
             "Contexto:\n{context}"
         )
         
@@ -107,11 +100,20 @@ def get_llm_chain(vector_store, api_key, model_name, temperature):
             ("human", "{input}"),
         ])
 
-        # 4. Conectar las cadenas (Retrieval -> Document Combination -> LLM)
-        question_answer_chain = create_stuff_documents_chain(llm, prompt)
-        rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+        # 4. Función para formatear los documentos recuperados
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
+
+        # 5. Construir la cadena RAG manualmente (nueva API)
+        rag_chain = (
+            {"context": retriever | format_docs, "input": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
 
         return rag_chain
+
     except Exception as e:
         st.error(f"Error al configurar la cadena RAG: {e}")
         return None
