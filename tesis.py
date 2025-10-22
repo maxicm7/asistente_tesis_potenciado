@@ -1,7 +1,6 @@
 import streamlit as st
 import pypdf
 import io
-import os
 
 # --- Importaciones actualizadas para LangChain v0.2+ ---
 from langchain_core.prompts import ChatPromptTemplate
@@ -9,7 +8,7 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.llms import HuggingFaceHub
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Chroma  # 👈 Usamos Chroma en lugar de FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # --- Configuración General ---
@@ -27,8 +26,7 @@ MASTER_PROMPT_ROLE = """
 @st.cache_resource
 def create_vector_store(pdf_files):
     """
-    Procesa los PDFs subidos: extrae texto, divide en chunks, genera embeddings y crea el índice FAISS.
-    Se cachea para no repetir el proceso si los archivos no cambian.
+    Procesa los PDFs subidos: extrae texto, divide en chunks, genera embeddings y crea el índice Chroma.
     """
     if not pdf_files:
         return None
@@ -53,26 +51,27 @@ def create_vector_store(pdf_files):
 
         # 2. Dividir el texto en trozos manejables (Chunks)
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,    # Tamaño del chunk en caracteres
-            chunk_overlap=200,  # Solapamiento para mantener contexto
+            chunk_size=1000,
+            chunk_overlap=200,
             length_function=len
         )
         chunks = text_splitter.split_text(all_text)
         st.info(f"📚 Documentos procesados en {len(chunks)} fragmentos de información.")
 
-        # 3. Generar Embeddings y Vector Store
-        # Usamos un modelo ligero y rápido para CPU
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        vector_store = FAISS.from_texts(texts=chunks, embedding=embeddings)
+        # 3. Generar Embeddings y Vector Store (Chroma)
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        )
+        vector_store = Chroma.from_texts(texts=chunks, embedding=embeddings)
         
         return vector_store
 
 def get_llm_chain(vector_store, api_key, model_name, temperature):
     """
-    Configura y devuelve la cadena RAG completa lista para usarse (compatible con LangChain >=0.2).
+    Configura y devuelve la cadena RAG completa lista para usarse (LangChain v0.2+).
     """
     try:
-        # 1. Configurar el LLM (Modelo de Lenguaje)
+        # 1. Configurar el LLM
         llm = HuggingFaceHub(
             repo_id=model_name,
             huggingfacehub_api_token=api_key,
@@ -85,26 +84,26 @@ def get_llm_chain(vector_store, api_key, model_name, temperature):
         )
 
         # 2. Configurar el Retriever
-        retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+        retriever = vector_store.as_retriever(search_kwargs={"k": 5})
 
         # 3. Crear el Prompt Template
         system_prompt = (
             f"{MASTER_PROMPT_ROLE}\n\n"
             "Utiliza los siguientes fragmentos de contexto recuperado para responder a la pregunta.\n"
             "Si no sabes la respuesta basándote en el contexto, dilo explícitamente. No inventes.\n\n"
-            "Contexto:\n{context}"
+            "Contexto:\n{{context}}"
         )
         
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
-            ("human", "{input}"),
+            ("human", "{{input}}"),
         ])
 
-        # 4. Función para formatear los documentos recuperados
+        # 4. Formatear documentos
         def format_docs(docs):
             return "\n\n".join(doc.page_content for doc in docs)
 
-        # 5. Construir la cadena RAG manualmente (nueva API)
+        # 5. Construir cadena RAG
         rag_chain = (
             {"context": retriever | format_docs, "input": RunnablePassthrough()}
             | prompt
@@ -113,7 +112,6 @@ def get_llm_chain(vector_store, api_key, model_name, temperature):
         )
 
         return rag_chain
-
     except Exception as e:
         st.error(f"Error al configurar la cadena RAG: {e}")
         return None
@@ -131,6 +129,8 @@ def main():
         st.session_state.vector_store = None
     if "rag_chain" not in st.session_state:
         st.session_state.rag_chain = None
+    if "last_config" not in st.session_state:
+        st.session_state.last_config = None
 
     # --- Barra Lateral de Configuración ---
     with st.sidebar:
@@ -139,7 +139,7 @@ def main():
         # API Key
         api_key = st.text_input("Hugging Face API Token", type="password", help="Empieza por 'hf_'")
         if not api_key and "HF_API_KEY" in st.secrets:
-             api_key = st.secrets["HF_API_KEY"]
+            api_key = st.secrets["HF_API_KEY"]
 
         # Selección de Modelo
         model_options = [
@@ -153,6 +153,7 @@ def main():
 
         st.divider()
         st.header("📄 Base de Conocimiento")
+        st.caption("ℹ️ Solo se admiten PDFs con texto seleccionable. Los documentos escaneados no serán procesados.")
         uploaded_files = st.file_uploader("Sube tus PDFs", type=["pdf"], accept_multiple_files=True)
         
         # Botón para procesar
@@ -163,12 +164,13 @@ def main():
                     st.session_state.rag_chain = get_llm_chain(
                         st.session_state.vector_store, api_key, selected_model, temperature
                     )
+                    st.session_state.last_config = (selected_model, temperature)
                     if st.session_state.rag_chain:
                         st.success("✅ ¡Sistema listo para chatear!")
             elif not api_key:
-                 st.warning("⚠️ Necesitas una API Key de Hugging Face.")
+                st.warning("⚠️ Necesitas una API Key de Hugging Face.")
             else:
-                 st.warning("⚠️ Por favor, sube al menos un PDF.")
+                st.warning("⚠️ Por favor, sube al menos un PDF.")
 
         # Botón para limpiar historial
         if st.button("🗑️ Limpiar Chat", use_container_width=True):
@@ -176,45 +178,29 @@ def main():
             st.rerun()
 
     # --- Área Principal de Chat ---
-    
-    # Si no hay sistema RAG listo, mostrar bienvenida
     if not st.session_state.rag_chain:
         st.info("👈 Configura tu API Key y sube tus documentos en la barra lateral para comenzar.")
         return
 
-    # Mostrar historial de mensajes
+    # Mostrar historial
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
     # Input del usuario
     if prompt := st.chat_input("Haz una pregunta sobre tus documentos..."):
-        # Añadir mensaje del usuario al historial
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Generar respuesta
         with st.chat_message("assistant"):
             with st.spinner("🤔 Analizando documentos..."):
                 try:
-                    response = st.session_state.rag_chain.invoke({"input": prompt})
-                    answer = response['answer']
-                    
-                    # Limpieza básica si el modelo devuelve el prompt por error (pasa a veces con HF Hub)
-                    if "System:" in answer or "Human:" in answer:
-                         answer = answer.split("Respuesta del Asistente:")[-1].strip()
+                    response = st.session_state.rag_chain.invoke(prompt)
+                    st.markdown(response)
 
-                    st.markdown(answer)
-                    
-                    # Opcional: Mostrar fuentes en un desplegable
-                    with st.expander("🔍 Ver fuentes consultadas"):
-                        for i, doc in enumerate(response['context']):
-                            st.markdown(f"**Fuente {i+1}**")
-                            st.caption(doc.page_content[:500] + "...") # Muestra solo los primeros 500 caracteres
-
-                    # Guardar respuesta en historial
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
+                    # Guardar en historial
+                    st.session_state.messages.append({"role": "assistant", "content": response})
 
                 except Exception as e:
                     st.error(f"Error generando la respuesta: {e}")
