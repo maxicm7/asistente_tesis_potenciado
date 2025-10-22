@@ -4,7 +4,8 @@ import streamlit as st
 from huggingface_hub import InferenceClient
 import pypdf
 import io
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+from langchain_community.text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.chains import create_retrieval_chain
