@@ -1,21 +1,19 @@
-# --- app.py (Versión con RAG y LangChain) ---
-
 import streamlit as st
-from huggingface_hub import InferenceClient
 import pypdf
 import io
+import os
 
-
+# --- Importaciones de LangChain (Actualizadas y verificadas) ---
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.llms import HuggingFaceHub
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.text_splitters import RecursiveCharacterTextSplitter # Esta es la que daba error
+# Usamos esta ruta que suele ser la más compatible entre versiones recientes
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# --- 1. Definición del Rol y Configuración Inicial ---
-# Mantenemos la definición del rol para guiar al LLM
+# --- Configuración General ---
 MASTER_PROMPT_ROLE = """
 [INICIO DE LA DEFINICIÓN DEL ROL]
 **Nombre del Rol:** Investigador Doctoral IA (IDA)
@@ -25,191 +23,194 @@ MASTER_PROMPT_ROLE = """
 [FIN DE LA DEFINICIÓN DEL ROL]
 """
 
-# --- 2. Funciones del Pipeline RAG ---
+# --- Funciones del Núcleo (Backend) ---
 
-# Usamos el cache de Streamlit para no tener que procesar los PDFs cada vez que el usuario interactúa.
-# El decorador cachea el resultado de la función. Si los archivos PDF no cambian, se reutiliza el resultado.
 @st.cache_resource
 def create_vector_store(pdf_files):
     """
-    Toma una lista de archivos PDF, extrae el texto, lo divide en trozos,
-    genera embeddings y crea una base de datos vectorial (vector store).
+    Procesa los PDFs subidos: extrae texto, divide en chunks, genera embeddings y crea el índice FAISS.
+    Se cachea para no repetir el proceso si los archivos no cambian.
     """
     if not pdf_files:
         return None
     
-    with st.spinner("Procesando documentos... Este proceso puede tardar un poco."):
-        # a. Extraer texto de todos los PDFs
+    with st.spinner("⚙️ Procesando documentos... (Esto puede tardar un poco la primera vez)"):
+        # 1. Extraer texto de todos los PDFs
         all_text = ""
         for pdf_file in pdf_files:
             try:
                 pdf_reader = pypdf.PdfReader(io.BytesIO(pdf_file.getvalue()))
-                text = "".join(page.extract_text() for page in pdf_reader.pages if page.extract_text())
-                all_text += text + "\n\n"
+                for page in pdf_reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        all_text += text + "\n"
             except Exception as e:
                 st.error(f"Error leyendo el archivo {pdf_file.name}: {e}")
+                return None
         
         if not all_text:
-            st.warning("No se pudo extraer texto de los PDFs.")
+            st.warning("No se pudo extraer texto utilizable de los PDFs.")
             return None
 
-        # b. Dividir el texto en trozos (chunks) manejables
+        # 2. Dividir el texto en trozos manejables (Chunks)
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500,  # Tamaño de cada trozo de texto
-            chunk_overlap=200, # Solapamiento para no perder contexto entre trozos
+            chunk_size=1000,    # Tamaño del chunk en caracteres
+            chunk_overlap=200,  # Solapamiento para mantener contexto
             length_function=len
         )
         chunks = text_splitter.split_text(all_text)
-        
-        st.info(f"Se han dividido los documentos en {len(chunks)} trozos de texto.")
+        st.info(f"📚 Documentos procesados en {len(chunks)} fragmentos de información.")
 
-        # c. Crear embeddings (convertir texto a vectores)
-        # Usamos un modelo de embeddings eficiente y popular. Se descargará la primera vez.
+        # 3. Generar Embeddings y Vector Store
+        # Usamos un modelo ligero y rápido para CPU
         embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        
-        # d. Crear la base de datos vectorial (Vector Store) con FAISS
-        # Esta es la base de conocimiento que usaremos para buscar información relevante.
         vector_store = FAISS.from_texts(texts=chunks, embedding=embeddings)
         
         return vector_store
 
-# --- Función para llamar a la API de Hugging Face (Modificada para LangChain) ---
-# En lugar de usarla directamente, la integramos en el ecosistema de LangChain
-def get_hf_llm(api_key, model, temperature):
-    """Crea una instancia del LLM de Hugging Face para usar con LangChain."""
-    if not api_key or not api_key.startswith("hf_"):
-        return None
+def get_llm_chain(vector_store, api_key, model_name, temperature):
+    """
+    Configura y devuelve la cadena RAG completa lista para usarse.
+    """
     try:
+        # 1. Configurar el LLM (Modelo de Lenguaje)
         llm = HuggingFaceHub(
-            repo_id=model,
+            repo_id=model_name,
             huggingfacehub_api_token=api_key,
-            model_kwargs={"temperature": temperature, "max_new_tokens": 4096}
+            model_kwargs={
+                "temperature": temperature,
+                "max_new_tokens": 1024, # Ajusta según necesites respuestas más largas
+                "repetition_penalty": 1.1,
+                "return_full_text": False
+            }
         )
-        return llm
+
+        # 2. Configurar el Retriever (Buscador)
+        retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+
+        # 3. Crear el Prompt Template
+        system_prompt = (
+            f"{MASTER_PROMPT_ROLE}\n\n"
+            "Utiliza los siguientes fragmentos de contexto recuperado para responder a la pregunta.\n"
+            "Si no sabes la respuesta basándote en el contexto, dilo. No inventes.\n\n"
+            "Contexto:\n{context}"
+        )
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", "{input}"),
+        ])
+
+        # 4. Conectar las cadenas (Retrieval -> Document Combination -> LLM)
+        question_answer_chain = create_stuff_documents_chain(llm, prompt)
+        rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+
+        return rag_chain
     except Exception as e:
-        st.error(f"Error al inicializar el modelo de Hugging Face: {e}")
+        st.error(f"Error al configurar la cadena RAG: {e}")
         return None
 
-# --- 3. Interfaz de Streamlit ---
-st.set_page_config(layout="wide", page_title="Asistente de Tesis Doctoral IA (con RAG)")
+# --- Función Principal (Frontend) ---
 
-# --- Estado de la sesión ---
-# Usamos st.session_state para mantener la conversación y la base de datos vectorial.
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "retriever" not in st.session_state:
-    st.session_state.retriever = None
-if "rag_chain" not in st.session_state:
-    st.session_state.rag_chain = None
+def main():
+    st.set_page_config(page_title="Asistente Tesis RAG", page_icon="🎓", layout="wide")
+    st.title("🎓 Asistente de Tesis Doctoral (RAG)")
 
-# --- UI Principal ---
-st.title("🎓 Asistente de Tesis Doctoral IA (con RAG)")
-st.markdown("""
-**Bienvenido a tu asistente de investigación potenciado por RAG.**
-1.  **Configura** tu API Key y el modelo en la barra lateral.
-2.  **Sube** uno o más artículos en PDF que formen tu base de conocimiento.
-3.  **Chatea** con tus documentos: haz preguntas, pide resúmenes, o solicita la generación de código basado en ellos.
-""")
+    # --- Inicialización del Estado de Sesión ---
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "vector_store" not in st.session_state:
+        st.session_state.vector_store = None
+    if "rag_chain" not in st.session_state:
+        st.session_state.rag_chain = None
 
-# --- Configuración en la barra lateral ---
-with st.sidebar:
-    st.header("Configuración")
-    api_key_value = st.secrets.get("HF_API_KEY", "")
-    hf_api_key_input = st.text_input(
-        "Hugging Face API Key", 
-        type="password", 
-        value=api_key_value
-    )
-    
-    st.subheader("Parámetros del Modelo")
-    model_reasoning = st.selectbox(
-        "Selección de Modelo",
-        # Qwen2 es una excelente opción. He añadido otros por si los prefieres.
-        ["mistralai/Mixtral-8x7B-Instruct-v0.1", "meta-llama/Meta-Llama-3-8B-Instruct", "Qwen/Qwen2-7B-Instruct", "google/gemma-7b-it"]
-    )
-    temp_slider = st.slider(
-        "Temperatura",
-        min_value=0.1, max_value=1.0, value=0.3, step=0.1,
-        help="Valores bajos = respuestas más factuales y predecibles. Valores altos = más creativas."
-    )
+    # --- Barra Lateral de Configuración ---
+    with st.sidebar:
+        st.header("🔧 Configuración")
+        
+        # API Key
+        api_key = st.text_input("Hugging Face API Token", type="password", help="Empieza por 'hf_'")
+        if not api_key and "HF_API_KEY" in st.secrets:
+             api_key = st.secrets["HF_API_KEY"]
 
-    st.subheader("Base de Conocimiento (PDFs)")
-    uploaded_files = st.file_uploader(
-        "Sube tus archivos PDF aquí", type="pdf", accept_multiple_files=True
-    )
+        # Selección de Modelo
+        model_options = [
+            "mistralai/Mixtral-8x7B-Instruct-v0.1",
+            "meta-llama/Meta-Llama-3-8B-Instruct",
+            "Qwen/Qwen2-7B-Instruct",
+            "google/gemma-1.1-7b-it"
+        ]
+        selected_model = st.selectbox("Modelo LLM", model_options, index=0)
+        temperature = st.slider("Temperatura (Creatividad)", 0.0, 1.0, 0.3, 0.1)
 
-    if uploaded_files:
-        if st.button("Procesar Documentos"):
-            vector_store = create_vector_store(uploaded_files)
-            if vector_store:
-                # Convertimos el vector_store en un "retriever", que es el componente que busca los documentos.
-                # 'k=5' significa que buscará los 5 trozos más relevantes.
-                st.session_state.retriever = vector_store.as_retriever(search_kwargs={"k": 5})
-                st.success(f"¡Documentos procesados! Ya puedes chatear con ellos.")
-                
-                # Crear la cadena de RAG una vez que el retriever esté listo
-                llm = get_hf_llm(hf_api_key_input, model_reasoning, temp_slider)
-                if llm:
-                    # Este es el prompt que "aumentaremos" con el contexto recuperado
-                    prompt_template = ChatPromptTemplate.from_template(
-                        f"{MASTER_PROMPT_ROLE}\n\n"
-                        "**Contexto recuperado de los documentos:**\n"
-                        "---------------------\n"
-                        "{context}\n"
-                        "---------------------\n\n"
-                        "**Pregunta del usuario:** {input}\n\n"
-                        "**Respuesta del Asistente (basada SÓLO en el contexto):**"
+        st.divider()
+        st.header("📄 Base de Conocimiento")
+        uploaded_files = st.file_uploader("Sube tus PDFs", type=["pdf"], accept_multiple_files=True)
+        
+        # Botón para procesar
+        if st.button("🔄 Procesar Documentos", use_container_width=True):
+            if uploaded_files and api_key:
+                st.session_state.vector_store = create_vector_store(uploaded_files)
+                if st.session_state.vector_store:
+                    st.session_state.rag_chain = get_llm_chain(
+                        st.session_state.vector_store, api_key, selected_model, temperature
                     )
-                    
-                    # Creamos la cadena que combina los documentos recuperados en el prompt
-                    document_chain = create_stuff_documents_chain(llm, prompt_template)
-                    
-                    # Creamos la cadena principal que primero recupera y luego genera
-                    st.session_state.rag_chain = create_retrieval_chain(st.session_state.retriever, document_chain)
-                else:
-                    st.error("No se pudo inicializar el modelo de lenguaje. Verifica tu API Key.")
+                    if st.session_state.rag_chain:
+                        st.success("✅ ¡Sistema listo para chatear!")
+            elif not api_key:
+                 st.warning("⚠️ Necesitas una API Key de Hugging Face.")
             else:
-                st.error("No se pudo crear la base de conocimiento a partir de los PDFs.")
+                 st.warning("⚠️ Por favor, sube al menos un PDF.")
 
-# --- 4. Interfaz de Chat ---
+        # Botón para limpiar historial
+        if st.button("🗑️ Limpiar Chat", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
 
-st.header("Chat con tus Documentos")
+    # --- Área Principal de Chat ---
+    
+    # Si no hay sistema RAG listo, mostrar bienvenida
+    if not st.session_state.rag_chain:
+        st.info("👈 Configura tu API Key y sube tus documentos en la barra lateral para comenzar.")
+        return
 
-# Mostrar mensajes anteriores
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    # Mostrar historial de mensajes
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-# Input del usuario
-if prompt := st.chat_input("Haz una pregunta sobre tus documentos..."):
-    # Añadir y mostrar el mensaje del usuario
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    # Input del usuario
+    if prompt := st.chat_input("Haz una pregunta sobre tus documentos..."):
+        # Añadir mensaje del usuario al historial
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-    # Procesar la respuesta si la cadena RAG está lista
-    if st.session_state.rag_chain:
+        # Generar respuesta
         with st.chat_message("assistant"):
-            with st.spinner("Buscando en tus documentos y generando respuesta..."):
+            with st.spinner("🤔 Analizando documentos..."):
                 try:
-                    # ¡Aquí ocurre la magia de RAG!
                     response = st.session_state.rag_chain.invoke({"input": prompt})
+                    answer = response['answer']
                     
-                    answer = response.get("answer", "No se pudo generar una respuesta.")
+                    # Limpieza básica si el modelo devuelve el prompt por error (pasa a veces con HF Hub)
+                    if "System:" in answer or "Human:" in answer:
+                         answer = answer.split("Respuesta del Asistente:")[-1].strip()
+
                     st.markdown(answer)
                     
-                    # Opcional: Mostrar las fuentes (los trozos de texto usados para responder)
-                    with st.expander("Ver fuentes utilizadas"):
-                        for i, doc in enumerate(response["context"]):
-                            st.write(f"**Fuente {i+1} (página aprox. basada en contenido):**")
-                            st.info(doc.page_content)
+                    # Opcional: Mostrar fuentes en un desplegable
+                    with st.expander("🔍 Ver fuentes consultadas"):
+                        for i, doc in enumerate(response['context']):
+                            st.markdown(f"**Fuente {i+1}**")
+                            st.caption(doc.page_content[:500] + "...") # Muestra solo los primeros 500 caracteres
 
-                    # Añadir la respuesta del asistente al historial
+                    # Guardar respuesta en historial
                     st.session_state.messages.append({"role": "assistant", "content": answer})
 
                 except Exception as e:
-                    st.error(f"Ocurrió un error al generar la respuesta.")
-                    st.exception(e)
+                    st.error(f"Error generando la respuesta: {e}")
 
-    else:
-        st.warning("Por favor, sube y procesa tus documentos en la barra lateral antes de chatear.")
+# --- Punto de Entrada ---
+if __name__ == "__main__":
+    main()
