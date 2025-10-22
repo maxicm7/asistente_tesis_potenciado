@@ -1,16 +1,7 @@
-# requirements.txt
-
-# --- Core Frameworks ---
 streamlit
 langchain
 langchain-community
-
-# --- PDF and Document Handling ---
 pypdf
-
-# --- Vector Store & Embeddings ---
 faiss-cpu
 sentence-transformers
-
-# --- Hugging Face Integration ---
 huggingface-hub
