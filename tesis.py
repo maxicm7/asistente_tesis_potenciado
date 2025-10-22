@@ -4,14 +4,20 @@ import io
 import os
 
 # --- Importaciones de LangChain (Actualizadas y verificadas) ---
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 from langchain_community.llms import HuggingFaceHub
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-# Usamos esta ruta que suele ser la más compatible entre versiones recientes
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# Para RAG: Estos son los nuevos módulos
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableParallel
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.documents import Document
 
 # --- Configuración General ---
 MASTER_PROMPT_ROLE = """
