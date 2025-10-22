@@ -5,13 +5,14 @@ from huggingface_hub import InferenceClient
 import pypdf
 import io
 
-from langchain_community.text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.llms import HuggingFaceHub # Para integrar el LLM en la cadena
+from langchain_community.llms import HuggingFaceHub
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.text_splitters import RecursiveCharacterTextSplitter # Esta es la que daba error
 
 # --- 1. Definición del Rol y Configuración Inicial ---
 # Mantenemos la definición del rol para guiar al LLM
